@@ -129,14 +129,22 @@ def strip_fences(text: str) -> str:
 SYSTEM_PROMPT = prompt("transcribe_system")
 
 
-def _window_instruction(first_page: int, last_page: int, total: int, tail: str) -> str:
+# Windows of earlier pages replayed as conversation context for the next window.
+# Kept to the most recent N (each is a user marker + the model's JSON reply) so
+# the cached prefix — and its token cost — stays bounded on long documents.
+_SESSION_WINDOW_MEMORY = 2
+
+
+def _window_instruction_session(
+    first_page: int, last_page: int, total: int, has_prior: bool
+) -> str:
     parts = [
         prompt("transcribe_window_header").format(
             first=first_page + 1, last=last_page + 1, total=total
         )
     ]
-    if tail:
-        parts.append(prompt("transcribe_window_tail").format(tail=tail))
+    if has_prior:
+        parts.append(prompt("transcribe_window_session"))
     parts.append(prompt("transcribe_window_json"))
     return "\n\n".join(parts)
 
@@ -286,24 +294,6 @@ def _window_recall(payload: dict[str, Any], expected: list[str]) -> float:
     return matched / len(expected)
 
 
-def _payload_tail(payload: dict[str, Any]) -> str:
-    """Last ~300 chars a payload contributes — the next slice's continuation tail."""
-    for b in reversed(payload.get("blocks", []) or []):
-        if not isinstance(b, dict):
-            continue
-        parts = [
-            str(b.get("lim", "") or ""),
-            str(b.get("text", "") or ""),
-            str(b.get("label", "") or ""),
-            str(b.get("value", "") or ""),
-        ]
-        parts += [str(c) for c in b.get("cells", []) or []]
-        text = " ".join(p for p in parts if p).strip()
-        if text:
-            return text[-300:]
-    return ""
-
-
 def _merge_payloads(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     """Merge two half-window payloads into one window-shaped payload.
 
@@ -375,11 +365,11 @@ def transcribe_document(
     with llm.record_usage_for(config):
 
         def run_attempts(
-            pages: list[int], page_tail: str, wlog: str, wfile: str
+            pages: list[int], prior_turns: list[dict[str, Any]], wlog: str, wfile: str
         ) -> tuple[float, str, dict[str, Any]] | None:
             """Gated attempt loop for one page range; best (recall, raw, payload)."""
             pdf_slice = document.slice_pdf(pdf_bytes, pages)
-            instr = _window_instruction(pages[0], pages[-1], total, page_tail)
+            instr = _window_instruction_session(pages[0], pages[-1], total, bool(prior_turns))
             exp = [t for p in pages if p < len(page_tokens) for t in page_tokens[p]]
             n_attempts = 1 + (_GATE_RETRIES if len(exp) >= _GATE_MIN_TOKENS else 0)
             found: tuple[float, str, dict[str, Any]] | None = None
@@ -398,13 +388,14 @@ def transcribe_document(
                             last=pages[-1] + 1,
                         )
                     )
-                raw = llm.call_continued(
+                raw = llm.call_continued_conversation(
                     config,
                     system_prompt=SYSTEM_PROMPT,
+                    prior_turns=prior_turns,
                     user_content=llm.build_user_content(
                         instruction_text=attempt_instr, pdf_bytes=pdf_slice
                     ),
-                    cache=True,  # cache the static system prefix across windows (Anthropic)
+                    cache=True,  # cache system + earlier-window turns (Anthropic)
                 )
                 suffix = "" if attempt == 0 else f"_retry{attempt}"
                 cache_write(
@@ -441,24 +432,27 @@ def transcribe_document(
                 )
             return found
 
+        # Earlier windows of THIS document, replayed to the model as prior
+        # conversation turns (its own JSON replies) so it transcribes each window
+        # with full continuity; the shared prefix is prompt-cached (Anthropic).
+        session_turns: list[dict[str, Any]] = []
         for w_idx, page_indices in enumerate(windows):
-            tail = blocks[-1].flat_text()[-300:] if blocks else ""
             wlog, wfile = f"w{w_idx + 1}", f"w{w_idx + 1:02d}"
             expected = [t for p in page_indices if p < len(page_tokens) for t in page_tokens[p]]
             gate_on = len(expected) >= _GATE_MIN_TOKENS
-            best = run_attempts(page_indices, tail, wlog, wfile)
+            best = run_attempts(page_indices, session_turns, wlog, wfile)
             if best is None:
                 log(f"{doc_name} {wlog}: window skipped")
                 continue
             # Stage-2 fallback: a retry that reproduces the same early stop is
-            # anchored in the window's CONTENT, so change the INPUT — split
-            # the page range and transcribe the halves.
+            # anchored in the window's CONTENT, so change the INPUT — split the
+            # page range and transcribe the halves (each still sees the earlier
+            # windows as prior conversation turns).
             if gate_on and best[0] < _GATE_RECALL and len(page_indices) >= 2:
                 log(f"{doc_name} {wlog}: still short after retry; splitting the window")
                 mid = (len(page_indices) + 1) // 2
-                half_a = run_attempts(page_indices[:mid], tail, f"{wlog}a", f"{wfile}a")
-                tail_b = _payload_tail(half_a[2]) if half_a else tail
-                half_b = run_attempts(page_indices[mid:], tail_b, f"{wlog}b", f"{wfile}b")
+                half_a = run_attempts(page_indices[:mid], session_turns, f"{wlog}a", f"{wfile}a")
+                half_b = run_attempts(page_indices[mid:], session_turns, f"{wlog}b", f"{wfile}b")
                 if half_a and half_b:
                     merged = _merge_payloads(half_a[2], half_b[2])
                     merged_recall = _window_recall(merged, expected)
@@ -480,6 +474,25 @@ def transcribe_document(
                 strip_fences(raw),
                 debug=debug,
             )
+            # Replay this window as prior context for the next one: a compact
+            # user marker + the model's own JSON reply. Keep only the most recent
+            # windows so the cached prefix stays bounded on long documents.
+            session_turns.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"(Pages {page_indices[0] + 1}-{page_indices[-1] + 1} "
+                            "transcribed above.)",
+                        }
+                    ],
+                }
+            )
+            session_turns.append(
+                {"role": "assistant", "content": [{"type": "text", "text": strip_fences(raw)}]}
+            )
+            del session_turns[: max(0, len(session_turns) - 2 * _SESSION_WINDOW_MEMORY)]
             _append_continuation(blocks, str(payload.get("continues", "") or ""))
             kept = 0
             for raw_block in payload.get("blocks", []) or []:

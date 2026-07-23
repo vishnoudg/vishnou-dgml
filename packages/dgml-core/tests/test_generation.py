@@ -515,7 +515,7 @@ def test_transcribe_document_reuses_cached_blocks(
     def boom(*args: object, **kwargs: object) -> str:
         raise AssertionError("must not transcribe when the blocks cache exists")
 
-    monkeypatch.setattr(llm, "call_continued", boom)
+    monkeypatch.setattr(llm, "call_continued_conversation", boom)
     blocks = transcribe_document(
         b"not-even-a-pdf",  # never parsed: the cache short-circuits before page counting
         doc_name="doc.pdf",
@@ -1719,6 +1719,49 @@ def _write_page_text(tmp_path: Path, words: list[str]) -> Path:
     return pt_dir
 
 
+def test_transcribe_session_replays_prior_window_as_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each window after the first receives the earlier windows as prior
+    conversation turns (a user marker + the model's own JSON reply)."""
+    from dgml_core.generation import document as document_mod
+    from dgml_core.generation import transcribe as transcribe_mod
+
+    words1 = [f"a{i:02d}" for i in range(20)]
+    words2 = [f"b{i:02d}" for i in range(20)]
+    pt_dir = tmp_path / "page_text"
+    pt_dir.mkdir()
+    for n, ws in ((1, words1), (2, words2)):
+        (pt_dir / f"page_{n}.json").write_text(
+            json.dumps({"page": n, "words": [{"t": w} for w in ws]})
+        )
+    monkeypatch.setattr(transcribe_mod, "pdf_page_count", lambda _p: 2)
+    monkeypatch.setattr(document_mod, "slice_pdf", lambda _b, idx: bytes(idx))
+
+    seen_prior: list[list[dict[str, object]]] = []
+
+    def fake_call(
+        config: llm.LLMConfig, *, prior_turns: list[dict[str, object]], **kwargs: object
+    ) -> str:
+        seen_prior.append(list(prior_turns))  # copy: run_attempts mutates the list later
+        instr = kwargs["user_content"][0]["text"]  # type: ignore[index]
+        return _fake_window_json(words1 if "pages 1-1" in instr else words2)
+
+    monkeypatch.setattr(llm, "call_continued_conversation", fake_call)
+    transcribe_mod.transcribe_document(
+        b"%PDF-fake",
+        doc_name="doc.pdf",
+        config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"),
+        window_size=1,
+        cache_dir=tmp_path,
+        page_text_dir=pt_dir,
+    )
+    assert len(seen_prior) == 2
+    assert seen_prior[0] == []  # first window: no prior context
+    assert [t["role"] for t in seen_prior[1]] == ["user", "assistant"]
+    assert "a00" in seen_prior[1][1]["content"][0]["text"]  # type: ignore[index]
+
+
 def test_transcribe_window_gate_retries_early_stopped_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1741,7 +1784,7 @@ def test_transcribe_window_gate_retries_early_stopped_window(
             return _fake_window_json(words[:8])  # early stop: 8 of 60 words
         return _fake_window_json(words)
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
+    monkeypatch.setattr(llm, "call_continued_conversation", fake_call)
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -1777,7 +1820,7 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
         calls.append(1)
         return _fake_window_json(words)
 
-    monkeypatch.setattr(llm, "call_continued", complete)
+    monkeypatch.setattr(llm, "call_continued_conversation", complete)
     transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -1793,7 +1836,7 @@ def test_transcribe_window_gate_no_retry_when_complete_or_ungated(
         calls.append(1)
         return _fake_window_json(words[:8])
 
-    monkeypatch.setattr(llm, "call_continued", sparse)
+    monkeypatch.setattr(llm, "call_continued_conversation", sparse)
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",
@@ -1886,7 +1929,7 @@ def test_transcribe_window_gate_splits_stubborn_window(
             return _fake_window_json(page1)
         return _fake_window_json(page2)  # half B: complete
 
-    monkeypatch.setattr(llm, "call_continued", fake_call)
+    monkeypatch.setattr(llm, "call_continued_conversation", fake_call)
     blocks = transcribe_mod.transcribe_document(
         b"%PDF-fake",
         doc_name="doc.pdf",

@@ -50,10 +50,12 @@
      columns). A two-column running list without column meaning is `item`s.
 "transcribe_window_header": |-
   Transcribe pages {first}-{last} of {total} into blocks.
-"transcribe_window_tail": |-
-  The previous window's transcription ended with:
-  <TAIL>{tail}</TAIL>
-  If your first page begins mid-sentence, put the completing text in "continues" and do NOT repeat anything inside <TAIL>.
+"transcribe_window_session": |-
+  The turns above are your transcription of the EARLIER pages of this same
+  document, for continuity only — do not repeat them. Transcribe ONLY the pages
+  attached now, continuing heading levels and numbering consistently with those
+  turns; if your first page begins mid-sentence, put the completing text in
+  "continues".
 "transcribe_window_json": |-
   Return JSON only: {"continues": "...", "blocks": [...]}.
 "transcribe_window_retry": |-

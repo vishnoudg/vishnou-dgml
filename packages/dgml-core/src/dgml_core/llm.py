@@ -583,6 +583,51 @@ def call_continued(
     return acc
 
 
+def call_continued_conversation(
+    config: LLMConfig,
+    *,
+    system_prompt: str | tuple[str, str],
+    prior_turns: list[dict[str, Any]],
+    user_content: list[dict[str, Any]],
+    cache: bool = False,
+    max_rounds: int = 4,
+) -> str:
+    """Like :func:`call_continued`, but with a multi-turn history preceding the
+    current user turn — the transcription "session".
+
+    Earlier windows of the SAME document are replayed as ``prior_turns``
+    (user/assistant pairs) so the model transcribes the current window with full
+    continuity of what it already produced (heading levels, defined terms). On
+    Anthropic the stable prefix — system + every prior turn — is marked cacheable
+    at its last block, so each window replays it at ~10%% token cost within the
+    5-min TTL. Length-truncation is continued exactly as in :func:`call_continued`.
+    """
+    is_anthropic = is_anthropic_model(config.model)
+    sys_msg = _build_system_message(system_prompt, cache=cache, is_anthropic=is_anthropic)
+    turns = [dict(t) for t in prior_turns]
+    if cache and is_anthropic and turns and isinstance(turns[-1].get("content"), list):
+        # One breakpoint at the end of the last prior turn caches system + all
+        # prior turns (Anthropic allows ≤4; one at the prefix end suffices).
+        turns[-1] = {**turns[-1], "content": _mark_last_block_cacheable(turns[-1]["content"])}
+    user_blocks = (
+        _mark_document_cacheable(user_content)
+        if (cache and is_anthropic and not turns)
+        else user_content
+    )
+    base: list[dict[str, Any]] = [sys_msg, *turns, {"role": "user", "content": user_blocks}]
+    acc = ""
+    with _record_call(config) as totals:
+        for _ in range(max_rounds):
+            messages = base + ([{"role": "assistant", "content": acc}] if acc else [])
+            response = _completion_with_retry(_build_completion_kwargs(config, messages=messages))
+            add_partial(totals, extract_cost_and_tokens(response))
+            choice = response.choices[0]
+            acc += cast(str, choice.message.content or "")
+            if getattr(choice, "finish_reason", None) != "length":
+                break
+    return acc
+
+
 def call_with_tools(
     config: LLMConfig,
     *,
