@@ -779,12 +779,16 @@ _SKELETON_STRUCTURES = {"heading", "field", "row"}
 # 25-420 lines; Underlease-style docs sat just past the old 400 cap and were
 # truncated) while still bounding a pathological 500-page manual.
 _PLAN_MAX_LINES_PER_DOC = 2000
-# Max documents whose skeleton feeds the single roster-planning call. Depth
-# beats breadth: planning sees FEW documents IN FULL rather than many
-# truncated ones (same worst-case line budget as the old 20 x 400). The
-# roster only needs the RECURRING roles of a same-kind docset; every document
-# is still fully labeled in Pass B (which extends the roster).
-_PLAN_MAX_DOCS = 4
+# Roster-planning sample. Instead of "the largest N documents" (which lets one
+# dominant layout crowd out a heterogeneous docset's minority layouts), pick
+# DIVERSE layouts: farthest-point selection over a structural signature, seeded
+# by the largest doc, stopping on a skeleton-size budget (chars) rather than a
+# fixed doc count — so many small diverse docs get more seats than a few huge
+# ones while the planning prompt stays bounded. Every document is still fully
+# labeled in Pass B. Knobs are tunable via the #47 benchmark.
+_PLAN_MIN_DOCS = 3
+_PLAN_MAX_DOCS = 12
+_PLAN_SKELETON_CHAR_BUDGET = 200_000
 # Unseeded runs label this many documents (the largest, same sort as planning)
 # as a PILOT first; their observed evidence promotes the planned roster to
 # confirmed before the rest of the batch labels against it. Seeded runs skip
@@ -828,6 +832,71 @@ def render_skeleton_listing(docs: Mapping[str, list[Block]]) -> str:
     return "\n".join(lines)
 
 
+def _doc_signature(blocks: list[Block]) -> list[float]:
+    """Shape-only structural signature for layout-diversity sampling.
+
+    Normalized block-structure proportions + heading-level histogram + presence
+    flags. Size is deliberately EXCLUDED — diversity is about layout, not length
+    (size seeds and tie-breaks the selection instead). All components are in
+    [0, 1]; a form (mostly ``field``) and an article (mostly ``p``, deep
+    headings) land far apart, two copies of one template land ~0 apart.
+    """
+    n = len(blocks) or 1
+    counts = Counter(b.structure for b in blocks)
+    struct = [counts.get(k, 0) / n for k in ("heading", "p", "item", "row", "field")]
+    heads = [b for b in blocks if b.structure == "heading"]
+    hn = len(heads) or 1
+    lvl_counts = Counter(min(6, max(1, b.level)) for b in heads)
+    levels = [lvl_counts.get(i, 0) / hn for i in range(1, 7)]
+    flags = [
+        float(counts.get("row", 0) > 0),
+        float(counts.get("field", 0) > 0),
+        float(counts.get("item", 0) > 0),
+    ]
+    return struct + levels + flags
+
+
+def _signature_distance(a: list[float], b: list[float]) -> float:
+    return float(sum((x - y) ** 2 for x, y in zip(a, b, strict=True)) ** 0.5)
+
+
+def _select_planning_docs(docs: Mapping[str, list[Block]]) -> dict[str, list[Block]]:
+    """Diverse, budget-bounded document sample for roster planning.
+
+    Farthest-point selection over each doc's structural signature: seed with the
+    largest document (richest common roles), then repeatedly add the document
+    whose layout is FARTHEST from those already chosen, until the skeleton-size
+    budget or the hard doc cap. Minority layouts are the farthest points, so they
+    are picked early; near-duplicate templates sit ~0 from an already-chosen doc,
+    so they are picked last (only if budget remains) — dedup falls out for free.
+    On a homogeneous docset every distance is ~0, so the argmax ties resolve to
+    the largest-first order — i.e. it degrades to the previous "largest N"
+    behavior with no downside. Deterministic (ties broken by largest-first/name).
+    """
+    items = sorted(docs.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    if len(items) <= _PLAN_MIN_DOCS:
+        return dict(items)
+    sig = {name: _doc_signature(bl) for name, bl in items}
+    size = {name: len(render_skeleton_listing({name: bl})) for name, bl in items}
+    chosen = [items[0][0]]
+    used = size[chosen[0]]
+    remaining = [name for name, _ in items[1:]]
+    while remaining and len(chosen) < _PLAN_MAX_DOCS:
+        best: str | None = None
+        best_dist = -1.0
+        for name in remaining:  # first max in this deterministic order wins ties
+            d = round(min(_signature_distance(sig[name], sig[c]) for c in chosen), 6)
+            if d > best_dist:
+                best_dist, best = d, name
+        assert best is not None
+        if used + size[best] > _PLAN_SKELETON_CHAR_BUDGET and len(chosen) >= _PLAN_MIN_DOCS:
+            break
+        chosen.append(best)
+        used += size[best]
+        remaining.remove(best)
+    return {name: docs[name] for name in chosen}
+
+
 def plan_concept_roster(
     docs: Mapping[str, list[Block]],
     *,
@@ -849,20 +918,15 @@ def plan_concept_roster(
     improves roster completeness and cross-run stability at the cost of one
     extra call. Set ``refine=False`` to skip it.
     """
-    # Cap the planning input. Sample the LARGEST documents (most blocks): a
-    # richer skeleton seeds a more complete roster, so the biggest docs cover
-    # the most recurring roles from the fewest samples. Ties broken by name for
-    # determinism. Pass B still labels every document.
-    # TODO: smarter sampling — cluster documents by skeleton shape and sample
-    # per cluster, so a heterogeneous docset's minority layouts are represented
-    # instead of being crowded out by the largest documents.
-    planning_docs = docs
-    if len(docs) > _PLAN_MAX_DOCS:
-        chosen = sorted(docs.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:_PLAN_MAX_DOCS]
-        planning_docs = dict(chosen)
+    # Sample DIVERSE document layouts (farthest-point over a structural
+    # signature, budget-bounded) so a heterogeneous docset's minority layouts
+    # are represented rather than crowded out by one dominant layout. Pass B
+    # still labels every document.
+    planning_docs = _select_planning_docs(docs)
+    if len(planning_docs) < len(docs):
         log(
-            f"Pass B.1: sampling {_PLAN_MAX_DOCS} of {len(docs)} docs "
-            "(largest skeletons) for roster planning"
+            f"Pass B.1: sampling {len(planning_docs)} of {len(docs)} docs "
+            "(diverse skeletons) for roster planning"
         )
 
     log(f"Pass B.1: planning concept roster from {len(planning_docs)} doc skeleton(s)...")
