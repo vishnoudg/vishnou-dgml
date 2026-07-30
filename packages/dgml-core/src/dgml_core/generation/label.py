@@ -779,12 +779,6 @@ _SKELETON_STRUCTURES = {"heading", "field", "row"}
 # 25-420 lines; Underlease-style docs sat just past the old 400 cap and were
 # truncated) while still bounding a pathological 500-page manual.
 _PLAN_MAX_LINES_PER_DOC = 2000
-# Max documents whose skeleton feeds the single roster-planning call. Depth
-# beats breadth: planning sees FEW documents IN FULL rather than many
-# truncated ones (same worst-case line budget as the old 20 x 400). The
-# roster only needs the RECURRING roles of a same-kind docset; every document
-# is still fully labeled in Pass B (which extends the roster).
-_PLAN_MAX_DOCS = 4
 # Unseeded runs label this many documents (the largest, same sort as planning)
 # as a PILOT first; their observed evidence promotes the planned roster to
 # confirmed before the rest of the batch labels against it. Seeded runs skip
@@ -828,6 +822,110 @@ def render_skeleton_listing(docs: Mapping[str, list[Block]]) -> str:
     return "\n".join(lines)
 
 
+# --- Role-inventory planning (Pass B.1 input) --------------------------------
+# The planner's job is to name the roles that RECUR across the docset, so give
+# it the recurring roles directly instead of a sample of whole documents. We
+# collect every distinct heading / form-field / table-column across ALL docs,
+# deduplicate by a normalized key, count how many documents each appears in,
+# and feed the frequency-gated inventory to planning. Versus doc-sampling this
+# covers every layout's roles (not just the largest docs'), never over-weights
+# an outlier document, and the frequency gate is built-in tag discipline —
+# rare one-off roles stay out of the shared roster and are picked up per-doc in
+# Pass B instead.
+_ROLE_MIN_DOCS = 2  # a role must appear in >= this many docs to count as recurring
+_ROLE_INVENTORY_MAX = 500  # hard cap on inventory lines (bounds a pathological docset)
+# Leading enumerator to strip before keying ("4.2)", "(a)", "b)") — never a
+# roman-numeral bare word like "IV", which is real content.
+_ENUM_RE = re.compile(r"^\s*(?:\(?\d[\d.]*\)?[.)]?|\([a-zA-Z]\)|[a-zA-Z]\))\s+")
+
+
+def _role_key(text: str) -> str:
+    """Normalize a role string so near-identical spellings group together."""
+    s = _ENUM_RE.sub("", text.strip())
+    s = re.sub(r"\s+", " ", s).strip(" \t:-\u2013\u2014.").lower()  # trim edge punct/dashes
+    return s if len(s) >= 2 and not s.isdigit() else ""
+
+
+def _collect_roles(docs: Mapping[str, list[Block]]) -> dict[str, dict[str, Any]]:
+    """Deduplicated cross-document role inventory keyed by normalized role name.
+
+    Each entry records the role's dominant kind (heading/field/column), the most
+    common original spelling, the set of documents it appears in, and one example
+    value (so the planner can name value-kind concepts, not just section topics).
+    """
+    inv: dict[str, dict[str, Any]] = {}
+
+    def add(kind: str, display: str, doc: str, example: str) -> None:
+        key = _role_key(display)
+        if not key:
+            return
+        rec = inv.setdefault(
+            key, {"kinds": Counter(), "displays": Counter(), "docs": set(), "example": ""}
+        )
+        rec["kinds"][kind] += 1
+        rec["displays"][display.strip()] += 1
+        rec["docs"].add(doc)
+        if example and not rec["example"]:
+            rec["example"] = re.sub(r"\s+", " ", example).strip()[:_SNIPPET_CHARS]
+
+    for name, blocks in docs.items():
+        n = len(blocks)
+        for i, b in enumerate(blocks):
+            if b.structure == "heading":
+                example = ""
+                # first value line within the section — the heading's leading value
+                for j in range(i + 1, min(i + 4, n)):
+                    nb = blocks[j]
+                    if nb.structure in ("p", "item"):
+                        example = nb.text
+                        break
+                    if nb.structure == "field":
+                        example = nb.value or (nb.options[0] if nb.options else "")
+                        break
+                add("heading", b.text, name, example)
+            elif b.structure == "field" and b.label:
+                add("field", b.label, name, b.value or (b.options[0] if b.options else ""))
+            elif b.structure == "row" and b.cells and (i == 0 or blocks[i - 1].structure != "row"):
+                # first row of a contiguous run = column headers; example from the next row
+                nxt = blocks[i + 1].cells if i + 1 < n and blocks[i + 1].structure == "row" else []
+                for c, cell in enumerate(b.cells):
+                    add("column", cell, name, nxt[c] if c < len(nxt) else "")
+    return inv
+
+
+def render_role_inventory(docs: Mapping[str, list[Block]]) -> tuple[str, int]:
+    """Consolidated recurring-role inventory feeding roster planning.
+
+    Returns the listing and the number of recurring roles it lists. Roles are
+    frequency-gated to those recurring across >= ``_ROLE_MIN_DOCS`` documents
+    (relaxed to all roles for a small or very homogeneous docset that would
+    otherwise yield an almost-empty inventory), sorted by document frequency.
+    """
+    inv = _collect_roles(docs)
+    total = len(docs)
+    floor = _ROLE_MIN_DOCS if total >= 4 else 1
+    recurring = [(k, r) for k, r in inv.items() if len(r["docs"]) >= floor]
+    if len(recurring) < 8 and floor > 1:
+        # Too homogeneous/small for the gate to leave a usable roster — keep all.
+        recurring = list(inv.items())
+    recurring.sort(key=lambda kr: (-len(kr[1]["docs"]), kr[0]))
+
+    lines = [f"== Recurring roles across {total} document(s) (consolidated, deduplicated) =="]
+    omitted = 0
+    for _key, rec in recurring:
+        if len(lines) - 1 >= _ROLE_INVENTORY_MAX:
+            omitted += 1
+            continue
+        kind = rec["kinds"].most_common(1)[0][0]
+        display = rec["displays"].most_common(1)[0][0]
+        example = f'  e.g. "{rec["example"]}"' if rec["example"] else ""
+        lines.append(f"[{kind}] {display}  · in {len(rec['docs'])}/{total} docs{example}")
+    if omitted:
+        # No silent caps: rarer roles dropped for size are still announced.
+        lines.append(f"… ({omitted} rarer role(s) omitted for size)")
+    return "\n".join(lines), len(recurring)
+
+
 def plan_concept_roster(
     docs: Mapping[str, list[Block]],
     *,
@@ -849,24 +947,17 @@ def plan_concept_roster(
     improves roster completeness and cross-run stability at the cost of one
     extra call. Set ``refine=False`` to skip it.
     """
-    # Cap the planning input. Sample the LARGEST documents (most blocks): a
-    # richer skeleton seeds a more complete roster, so the biggest docs cover
-    # the most recurring roles from the fewest samples. Ties broken by name for
-    # determinism. Pass B still labels every document.
-    # TODO: smarter sampling — cluster documents by skeleton shape and sample
-    # per cluster, so a heterogeneous docset's minority layouts are represented
-    # instead of being crowded out by the largest documents.
-    planning_docs = docs
-    if len(docs) > _PLAN_MAX_DOCS:
-        chosen = sorted(docs.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:_PLAN_MAX_DOCS]
-        planning_docs = dict(chosen)
-        log(
-            f"Pass B.1: sampling {_PLAN_MAX_DOCS} of {len(docs)} docs "
-            "(largest skeletons) for roster planning"
-        )
-
-    log(f"Pass B.1: planning concept roster from {len(planning_docs)} doc skeleton(s)...")
-    listing = render_skeleton_listing(planning_docs)
+    # Build the planning input from a consolidated ROLE INVENTORY rather than a
+    # sample of whole documents: every distinct heading/field/column across all
+    # docs, deduplicated and frequency-gated to the recurring ones. This covers
+    # every layout's roles regardless of which docs are largest, and the
+    # frequency gate keeps one-off roles out of the shared roster (they are
+    # still picked up per-doc in Pass B).
+    listing, n_roles = render_role_inventory(docs)
+    log(
+        f"Pass B.1: planning concept roster from {n_roles} recurring "
+        f"role(s) across {len(docs)} doc(s)..."
+    )
     cache_write(cache_dir, "plan_roster_input.txt", listing, debug=debug)
     try:
         if refine:

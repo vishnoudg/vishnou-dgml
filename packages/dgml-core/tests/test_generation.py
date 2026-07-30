@@ -372,10 +372,12 @@ def test_label_documents_plans_then_labels_with_roster(
     monkeypatch.setattr(llm, "call", fake_call)
     warnings = label_documents(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
     assert warnings == []
-    # Pass B.1 plans the roster over EVERY document's skeleton side by side (one
-    # call_with_refinement); then one labeling call per document carries it.
+    # Pass B.1 plans the roster over a consolidated role inventory across EVERY
+    # document (one call_with_refinement); then one labeling call per doc carries
+    # it. A role shared by both docs shows a 2/2 document frequency.
     assert len(calls) == 2
-    assert "== a.pdf ==" in plan["listing"] and "== b.pdf ==" in plan["listing"]
+    assert plan["listing"].startswith("== Recurring roles across 2 document(s)")
+    assert "· in 2/2 docs" in plan["listing"]
     first, second = (text for _system, text in calls)
     # Doc 1 labels against the PLANNED tier — the roster is proposed, not yet
     # observed, and the description is never dressed up as an example.
@@ -793,27 +795,29 @@ def test_convert_batch_concepts_always_docset_namespaced(
     assert "old.pdf" not in seen
 
 
-def test_plan_concept_roster_caps_to_largest_docs(
+def test_plan_concept_roster_builds_deduped_recurring_role_inventory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Over the cap, only the largest-skeleton docs feed the planning call."""
-    from dgml_core.generation.label import _PLAN_MAX_DOCS, plan_concept_roster
+    """Planning reads a deduplicated role inventory; one-off roles are gated out."""
+    from dgml_core.generation.label import plan_concept_roster
 
-    # _PLAN_MAX_DOCS + 2 docs; doc00/doc01 are large, the rest are tiny.
+    # 5 docs sharing 10 field roles; doc00 alone carries a one-off field.
     docs: dict[str, list[Block]] = {
         f"doc{i:02d}.pdf": [
-            _b("heading", f"{i}-{j}", text=f"H{j}", level=1) for j in range(50 if i < 2 else 2)
+            _b("field", f"{i}-{k}", label=f"Shared Field {k}", value=f"v{k}") for k in range(10)
         ]
-        for i in range(_PLAN_MAX_DOCS + 2)
+        for i in range(5)
     }
+    docs["doc00.pdf"].append(_b("field", "0-x", label="One Off Rider", value="x"))
 
     captured = _patch_roster(monkeypatch, {"Foo": "a foo role"})
     roster = plan_concept_roster(docs, config=llm.LLMConfig(model="anthropic/claude-haiku-4-5"))
 
     listing = captured["listing"]
-    assert listing.count("== doc") == _PLAN_MAX_DOCS  # only the cap many docs planned
-    assert "== doc00.pdf ==" in listing and "== doc01.pdf ==" in listing  # largest included
-    assert "== doc21.pdf ==" not in listing  # a tiny doc dropped from planning
+    assert listing.startswith("== Recurring roles across 5 document(s)")
+    assert "[field] Shared Field 5  · in 5/5 docs" in listing  # shared role, frequency shown
+    assert listing.count("Shared Field 5") == 1  # 5 docs collapsed to one line
+    assert "One Off Rider" not in listing  # appears in 1 doc < gate → left to Pass B
     assert roster == {"Foo": "a foo role"}
 
 

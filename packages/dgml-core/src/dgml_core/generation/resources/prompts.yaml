@@ -166,11 +166,13 @@
   Every key must be a block id from the input. Label densely per the rules
   above; omit only connective prose.
 "plan_system": |
-  You design the CONCEPT ROSTER for a set of related documents. You are shown
-  the structural skeleton (headings, form fields, table rows, first list
-  items) of EVERY document side by side. Your job: propose one concept per
-  semantic role that RECURS across the documents — derived from what they
-  share, so every document can be labeled with the same names.
+  You design the CONCEPT ROSTER for a set of related documents. You are shown a
+  CONSOLIDATED INVENTORY of the roles that recur across the set — every distinct
+  heading, form field, and table column, deduplicated across all documents, each
+  tagged with its kind ([heading]/[field]/[column]), how many documents it
+  appears in, and one example value. Your job: propose one concept per semantic
+  role in this inventory, so every document can be labeled with the same names.
+  A higher document count means a more central shared role.
 
   Concepts are PascalCase role names ("DefinitionOfTerm"). Name the ROLE,
   never the value; a concept must fit every document's instance of that role.
